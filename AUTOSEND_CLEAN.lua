@@ -29,6 +29,14 @@ local CFG = {
 
     -- Interval polling drop (ms)
     ScanInterval = 1500,
+    -- Jendela listenEvents (detik). Sisanya dijeda supaya total cadence
+    -- tetap ~ ScanInterval tanpa menabrak batas minimum timer.
+    ListenWindow = 1,
+
+    -- Radius (tile) untuk mencari player di sekitar drop. Sengaja lebih lebar
+    -- dari ScanRange: orang yang sempat jalan sedikit tetap terdeteksi,
+    -- sementara lock tetap diambil pada radius dekat.
+    CreditRange  = 12,
 
     -- Prefix command chat
     Prefix       = ".",
@@ -111,7 +119,7 @@ local function nearestPlayer(world, px, py)
         end
     end
     -- batasi ~ scan range (pixel = tile * 32)
-    local maxPx = (CFG.ScanRange * 32) ^ 2
+    local maxPx = (CFG.CreditRange * 32) ^ 2
     if best and bestDist <= maxPx then return best end
     return nil
 end
@@ -126,28 +134,46 @@ local function creditDeposit(name, wl)
     print("[DEPOSIT] " .. name .. " +" .. fmtNum(wl) .. " WL (total " .. fmtNum(balances[name]) .. ")")
 end
 
-local function pollDrops()
-    while true do
-        pcall(function()
-            if bot:isInWorld(CFG.World) then
-                local world = bot:getWorld()
-                local now = snapshotObjects(world)
-                for oid, obj in pairs(now) do
-                    if not knownObjs[oid] then
-                        local wl = wlValue(obj.id, obj.count)
-                        if wl then
-                            local p = nearestPlayer(world, obj.x, obj.y)
-                            if p then creditDeposit(p.name, wl) end
-                        end
-                    end
-                end
-                knownObjs = now
-                -- ambil lock yang tergeletak di sekitar bot
-                bot:collect(CFG.ScanRange, 250)
-            end
-        end)
-        sleep(CFG.ScanInterval)
+-- Statistik satu putaran terakhir (dipakai buat heartbeat di console).
+local stats = { world = "-", objects = 0, credited = 0 }
+
+-- Satu kali pemindaian drop. Sengaja BUKAN while-loop di thread terpisah:
+-- runThread punya Lua state sendiri sehingga state lokal di file ini
+-- (knownObjs / balances) tidak bisa diandalkan di dalam thread.
+local function pollOnce()
+    stats.credited = 0
+    if not bot:isInWorld(CFG.World) then
+        return "not-in-world"
     end
+    local world = bot:getWorld()
+    stats.world = tostring(world.name)
+    local now = snapshotObjects(world)
+    stats.objects = 0
+    for _ in pairs(now) do
+        stats.objects = stats.objects + 1
+    end
+    for oid, obj in pairs(now) do
+        if not knownObjs[oid] then
+            local wl = wlValue(obj.id, obj.count)
+            if wl then
+                local p = nearestPlayer(world, obj.x, obj.y)
+                if p then
+                    local nm = p.name
+                    if nm == nil or nm == "" then
+                        nm = p.altName
+                    end
+                    creditDeposit(nm, wl)
+                    stats.credited = stats.credited + 1
+                else
+                    print("[DROP] lock id=" .. tostring(obj.id) .. " x" .. tostring(obj.count) .. " -> tidak ada player dalam radius " .. CFG.CreditRange .. " tile, tidak di-credit")
+                end
+            end
+        end
+    end
+    knownObjs = now
+    -- ambil lock yang tergeletak di sekitar bot
+    bot:collect(CFG.ScanRange, 250)
+    return "ok"
 end
 
 ---------------------[ MONITOR VENDING ]------------------------
@@ -254,14 +280,39 @@ local function main()
         sleep(5000)
     end
 
-    -- thread polling drop deposit
-    runThread(pollDrops)
-
     sendWebhook("Bot Online", "AutoSend aktif di world **" .. CFG.World .. "**")
 
-    -- loop event listener (blocking per-window, ulangi terus)
+    -- Loop utama: pindai drop -> dengarkan event -> jeda sisa waktu.
+    -- Tidak memakai runThread supaya tidak bergantung Lua state thread lain.
+    local tick = 0
+    local lastWorld = nil
+    local warned = false
     while true do
-        listenEvents(10)
+        tick = tick + 1
+        local _0xok, _0xstatus = pcall(pollOnce)
+        if not _0xok then
+            print("[ERROR] poll gagal: " .. tostring(_0xstatus))
+        elseif _0xstatus == "not-in-world" then
+            if not warned then
+                warned = true
+                print("[WARN] bot tidak di world \"" .. CFG.World .. "\" -> deposit tidak akan terdeteksi")
+            end
+        else
+            warned = false
+            if stats.world ~= lastWorld then
+                lastWorld = stats.world
+                knownObjs = {}
+                print("[INFO] monitoring world \"" .. lastWorld .. "\"")
+            end
+            if tick % 20 == 0 then
+                print("[HEARTBEAT] tick " .. tick .. " | world=" .. stats.world .. " | objek=" .. stats.objects .. " | deposit=" .. stats.credited)
+            end
+        end
+        listenEvents(CFG.ListenWindow)
+        local _0xrest = CFG.ScanInterval - CFG.ListenWindow * 1000
+        if _0xrest > 0 then
+            sleep(_0xrest)
+        end
     end
 end
 
