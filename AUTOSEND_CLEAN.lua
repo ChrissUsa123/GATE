@@ -1,9 +1,9 @@
---============================================================--
+--==============================================================
 --   AUTO SEND x VENDING SYSTEM  |  CLEAN REBUILD (NO WM)
 --   Target API : Lucifer Lua v2.86
 --   Kompatibel : loader lama (membaca variabel global dari
 --                file config) maupun standalone (edit CONFIG)
---============================================================--
+--==============================================================
 
 --------------------------[ CONFIG ]--------------------------
 -- Variabel ini otomatis membaca setting dari file loader.
@@ -29,14 +29,6 @@ local CFG = {
 
     -- Interval polling drop (ms)
     ScanInterval = 1500,
-    -- Jendela listenEvents (detik). Sisanya dijeda supaya total cadence
-    -- tetap ~ ScanInterval tanpa menabrak batas minimum timer.
-    ListenWindow = 1,
-
-    -- Radius (tile) untuk mencari player di sekitar drop. Sengaja lebih lebar
-    -- dari ScanRange: orang yang sempat jalan sedikit tetap terdeteksi,
-    -- sementara lock tetap diambil pada radius dekat.
-    CreditRange  = 12,
 
     -- Prefix command chat
     Prefix       = ".",
@@ -119,7 +111,7 @@ local function nearestPlayer(world, px, py)
         end
     end
     -- batasi ~ scan range (pixel = tile * 32)
-    local maxPx = (CFG.CreditRange * 32) ^ 2
+    local maxPx = (CFG.ScanRange * 32) ^ 2
     if best and bestDist <= maxPx then return best end
     return nil
 end
@@ -134,46 +126,62 @@ local function creditDeposit(name, wl)
     print("[DEPOSIT] " .. name .. " +" .. fmtNum(wl) .. " WL (total " .. fmtNum(balances[name]) .. ")")
 end
 
--- Statistik satu putaran terakhir (dipakai buat heartbeat di console).
-local stats = { world = "-", objects = 0, credited = 0 }
+-- DONATION BOX.
+-- Orang donasi dengan WRENCH ke block bernama "Donation Box", bukan drop di
+-- tanah. Lock masuk ke dalam box sehingga tidak muncul di world:getObjects().
+-- Yang menyebut GrowID hanya pesan SISTEM di console, jadi bacalah dari situ.
+-- Hanya pesan yang menyebut "Donation Box" yang diproses.
+local function handleDonationBox(text)
+    local clean = removeColor(text)
+    -- buang chat player (!) dan slash command (/)
+    local first = string.sub(clean, 1, 1)
+    if first == "!" or first == "/" then return end
 
--- Satu kali pemindaian drop. Sengaja BUKAN while-loop di thread terpisah:
--- runThread punya Lua state sendiri sehingga state lokal di file ini
--- (knownObjs / balances) tidak bisa diandalkan di dalam thread.
-local function pollOnce()
-    stats.credited = 0
-    if not bot:isInWorld(CFG.World) then
-        return "not-in-world"
+    local low = string.lower(clean)
+    -- hanya item Donation Box
+    if not string.find(low, "donation box", 1, true) then return end
+
+    -- ambil GrowID + jumlah dari pesan sistem
+    local name, num = string.match(low, "^%*?([%w_%-%.]+)%*?.-(%d+)")
+    if not name or not num then
+        print("[BOX] " .. clean)
+        return
     end
-    local world = bot:getWorld()
-    stats.world = tostring(world.name)
-    local now = snapshotObjects(world)
-    stats.objects = 0
-    for _ in pairs(now) do
-        stats.objects = stats.objects + 1
-    end
-    for oid, obj in pairs(now) do
-        if not knownObjs[oid] then
-            local wl = wlValue(obj.id, obj.count)
-            if wl then
-                local p = nearestPlayer(world, obj.x, obj.y)
-                if p then
-                    local nm = p.name
-                    if nm == nil or nm == "" then
-                        nm = p.altName
-                    end
-                    creditDeposit(nm, wl)
-                    stats.credited = stats.credited + 1
-                else
-                    print("[DROP] lock id=" .. tostring(obj.id) .. " x" .. tostring(obj.count) .. " -> tidak ada player dalam radius " .. CFG.CreditRange .. " tile, tidak di-credit")
-                end
-            end
+
+    -- ambil nama asli dari world supaya kapitalisasi GrowID benar
+    local real = nil
+    for _, p in ipairs(bot:getWorld():getPlayers() or {}) do
+        if type(p.name) == "string" and string.lower(p.name) == name then
+            real = p.name
+            break
         end
     end
-    knownObjs = now
-    -- ambil lock yang tergeletak di sekitar bot
-    bot:collect(CFG.ScanRange, 250)
-    return "ok"
+
+    creditDeposit(real or name, tonumber(num))
+end
+
+local function pollDrops()
+    while true do
+        pcall(function()
+            if bot:isInWorld(CFG.World) then
+                local world = bot:getWorld()
+                local now = snapshotObjects(world)
+                for oid, obj in pairs(now) do
+                    if not knownObjs[oid] then
+                        local wl = wlValue(obj.id, obj.count)
+                        if wl then
+                            local p = nearestPlayer(world, obj.x, obj.y)
+                            if p then creditDeposit(p.name, wl) end
+                        end
+                    end
+                end
+                knownObjs = now
+                -- ambil lock yang tergeletak di sekitar bot
+                bot:collect(CFG.ScanRange, 250)
+            end
+        end)
+        sleep(CFG.ScanInterval)
+    end
 end
 
 ---------------------[ MONITOR VENDING ]------------------------
@@ -248,18 +256,24 @@ end
 -------------------------[ EVENTS ]-----------------------------
 
 addEvent(Event.variantlist, function(values, netid)
-    -- OnConsoleMessage = chat & notifikasi server
-    local v0 = values and (values[0] or values[1])
+    -- values itu objek Variant, bukan tabel biasa.
+    -- API resmi: values:get(0):getString() = nama fungsi
+    --            values:get(1):getString() = isi pesan
+    local v0 = values and values:get(0):getString()
     if type(v0) == "string" then
         if v0:find("OnConsoleMessage") then
-            local msg = values[1] or values[2]
-            if type(msg) == "string" then checkVendMessage(msg) end
+            local msg = values:get(1):getString()
+            if type(msg) == "string" then
+                checkVendMessage(msg)
+                handleDonationBox(msg)
+            end
         end
     end
 end)
 
 addEvent(Event.game_message, function(text)
     checkVendMessage(text)
+    handleDonationBox(text)
 end)
 
 ------------------------[ MAIN LOOP ]---------------------------
@@ -272,6 +286,7 @@ local function main()
     print("==================================")
 
     bot.auto_reconnect = true
+    bot.auto_collect   = true   -- tanpa ini bot tidak pernah ambil lock sendiri
     bot.custom_status  = "AutoSend Aktif"
 
     -- warp ke world deposit kalau belum di sana
@@ -280,39 +295,14 @@ local function main()
         sleep(5000)
     end
 
+    -- thread polling drop deposit
+    runThread(pollDrops)
+
     sendWebhook("Bot Online", "AutoSend aktif di world **" .. CFG.World .. "**")
 
-    -- Loop utama: pindai drop -> dengarkan event -> jeda sisa waktu.
-    -- Tidak memakai runThread supaya tidak bergantung Lua state thread lain.
-    local tick = 0
-    local lastWorld = nil
-    local warned = false
+    -- loop event listener (blocking per-window, ulangi terus)
     while true do
-        tick = tick + 1
-        local _0xok, _0xstatus = pcall(pollOnce)
-        if not _0xok then
-            print("[ERROR] poll gagal: " .. tostring(_0xstatus))
-        elseif _0xstatus == "not-in-world" then
-            if not warned then
-                warned = true
-                print("[WARN] bot tidak di world \"" .. CFG.World .. "\" -> deposit tidak akan terdeteksi")
-            end
-        else
-            warned = false
-            if stats.world ~= lastWorld then
-                lastWorld = stats.world
-                knownObjs = {}
-                print("[INFO] monitoring world \"" .. lastWorld .. "\"")
-            end
-            if tick % 20 == 0 then
-                print("[HEARTBEAT] tick " .. tick .. " | world=" .. stats.world .. " | objek=" .. stats.objects .. " | deposit=" .. stats.credited)
-            end
-        end
-        listenEvents(CFG.ListenWindow)
-        local _0xrest = CFG.ScanInterval - CFG.ListenWindow * 1000
-        if _0xrest > 0 then
-            sleep(_0xrest)
-        end
+        listenEvents(10)
     end
 end
 
