@@ -1,6 +1,6 @@
 --==============================================================
 --   AUTO SEND x VENDING SYSTEM  |  CLEAN REBUILD (NO WM)
---   Target API : Lucifer Lua v2.86
+--   Target API : Lucifer Lua v2.86 (Nuron / Kwelpinator docs)
 --   Kompatibel : loader lama (membaca variabel global dari
 --                file config) maupun standalone (edit CONFIG)
 --==============================================================
@@ -25,7 +25,9 @@ local CFG = {
     ItemBGL      = 7188,   -- Blue Gem Lock = 10000 WL
 
     -- Radius scan drop & collect (tile)
-    ScanRange    = 4,
+    -- CATATAN: batas pickup server hanya 64 pixel = 2 tile.
+    -- Nilai > 2 tidak akan menambah jangkauan, hanya membosankan.
+    ScanRange    = 2,
 
     -- Interval polling drop (ms)
     ScanInterval = 1500,
@@ -62,6 +64,23 @@ local function wlValue(itemID, count)
     if itemID == CFG.ItemBGL then return count * 10000 end
     return nil -- bukan lock, diabaikan
 end
+
+-- Unit WAJIB camelCase tanpa spasi: WorldLock / DiamondLock / BlueGemLock.
+-- Bot Discord hanya mengenali tiga nama itu.
+local function unitName(itemID)
+    if itemID == CFG.ItemDL  then return "DiamondLock" end
+    if itemID == CFG.ItemBGL then return "BlueGemLock" end
+    return "WorldLock"
+end
+
+local UNIT_BY_TEXT = {
+    ["world lock"]    = "WorldLock",
+    ["diamond lock"]  = "DiamondLock",
+    ["blue gem lock"] = "BlueGemLock",
+    ["worldlock"]     = "WorldLock",
+    ["diamondlock"]   = "DiamondLock",
+    ["bluegem lock"]  = "BlueGemLock",
+}
 
 -------------------------[ WEBHOOK ]----------------------------
 
@@ -116,21 +135,34 @@ local function nearestPlayer(world, px, py)
     return nil
 end
 
-local function creditDeposit(name, wl)
+-- PENTING: bot Discord hanya membaca DESCRIPTION embed dan mencari pola
+-- "GrowID: <nama>" serta "Amount: <jumlah> <Unit>".
+-- Kalau formatnya beda, saldo pembeli TIDAK akan bertambah.
+local function creditDeposit(name, count, unit)
+    local itemID = CFG.ItemWL
+    if unit == "DiamondLock" then itemID = CFG.ItemDL end
+    if unit == "BlueGemLock" then itemID = CFG.ItemBGL end
+    local wl = wlValue(itemID, count) or 0
     balances[name] = (balances[name] or 0) + wl
-    sendWebhook("Deposit Masuk", "**" .. name .. "** deposit **" .. fmtNum(wl) .. " WL**", {
-        { "GrowID", name, true },
-        { "Jumlah", fmtNum(wl) .. " WL", true },
-        { "Total Balance", fmtNum(balances[name]) .. " WL", true },
-    })
-    print("[DEPOSIT] " .. name .. " +" .. fmtNum(wl) .. " WL (total " .. fmtNum(balances[name]) .. ")")
+    -- FORMAT ASLI (lihat pesan "DONATION LOGS" di channel):
+    --   title       : DONATION LOGS
+    --   description : "GrowID: <nama>" + "Amount: <jumlah> <Unit>"
+    -- Bot Discord hanya mem-parse description itu. Emoji custom sengaja
+    -- tidak disertakan karena ID-nya milik server lain dan akan tampil
+    -- sebagai teks mentah di server Anda.
+    sendWebhook("DONATION LOGS",
+        "GrowID: " .. name .. " \nAmount: " .. count .. " " .. unit)
+    print("[DEPOSIT] " .. name .. " +" .. count .. " " .. unit ..
+          " = " .. fmtNum(wl) .. " WL (total " .. fmtNum(balances[name]) .. ")")
 end
 
--- DONATION BOX.
--- Orang donasi dengan WRENCH ke block bernama "Donation Box", bukan drop di
--- tanah. Lock masuk ke dalam box sehingga tidak muncul di world:getObjects().
--- Yang menyebut GrowID hanya pesan SISTEM di console, jadi bacalah dari situ.
--- Hanya pesan yang menyebut "Donation Box" yang diproses.
+---------------------[ DONATION BOX ]--------------------------
+
+-- Donation Box bukan Giving Tree: ia block solid biasa tanpa tile extra
+-- sendiri, jadi isinya TIDAK pernah muncul di world:getObjects().
+-- Satu-satunya sumber GrowID + jumlah adalah PESAN SISTEM di console.
+-- Contoh pesan yang ditangani: "**Vixhan** places 1 World Lock into the
+-- Donation Box"
 local function handleDonationBox(text)
     local clean = removeColor(text)
     -- buang chat player (!) dan slash command (/)
@@ -138,11 +170,12 @@ local function handleDonationBox(text)
     if first == "!" or first == "/" then return end
 
     local low = string.lower(clean)
-    -- hanya item Donation Box
-    if not string.find(low, "donation box", 1, true) then return end
+    -- hanya pesan berujar donasi
+    if not string.find(low, "donat", 1, true) then return end
 
-    -- ambil GrowID + jumlah dari pesan sistem
-    local name, num = string.match(low, "^%*?([%w_%-%.]+)%*?.-(%d+)")
+    -- "**Vixhan** places 1 World Lock into the Donation Box"
+    local name, num, item = string.match(low,
+        "^%*?([%w_%-%.]+)%*?[^%d]*(%d+)%s*([%a ]+)")
     if not name or not num then
         print("[BOX] " .. clean)
         return
@@ -157,7 +190,7 @@ local function handleDonationBox(text)
         end
     end
 
-    creditDeposit(real or name, tonumber(num))
+    creditDeposit(real or name, tonumber(num), UNIT_BY_TEXT[(item or ""):lower()] or "WorldLock")
 end
 
 local function pollDrops()
@@ -171,7 +204,7 @@ local function pollDrops()
                         local wl = wlValue(obj.id, obj.count)
                         if wl then
                             local p = nearestPlayer(world, obj.x, obj.y)
-                            if p then creditDeposit(p.name, wl) end
+                            if p then creditDeposit(p.name, obj.count, unitName(obj.id)) end
                         end
                     end
                 end
@@ -255,18 +288,16 @@ end
 
 -------------------------[ EVENTS ]-----------------------------
 
+-- values adalah objek Variant (bukan tabel biasa).
+-- API Lucifer: values:get(0):getString() = nama fungsi
+--              values:get(1):getString() = isi pesan
 addEvent(Event.variantlist, function(values, netid)
-    -- values itu objek Variant, bukan tabel biasa.
-    -- API resmi: values:get(0):getString() = nama fungsi
-    --            values:get(1):getString() = isi pesan
     local v0 = values and values:get(0):getString()
-    if type(v0) == "string" then
-        if v0:find("OnConsoleMessage") then
-            local msg = values:get(1):getString()
-            if type(msg) == "string" then
-                checkVendMessage(msg)
-                handleDonationBox(msg)
-            end
+    if type(v0) == "string" and v0:find("OnConsoleMessage", 1, true) then
+        local msg = values:get(1):getString()
+        if type(msg) == "string" then
+            checkVendMessage(msg)
+            handleDonationBox(msg)
         end
     end
 end)
@@ -286,7 +317,7 @@ local function main()
     print("==================================")
 
     bot.auto_reconnect = true
-    bot.auto_collect   = true   -- tanpa ini bot tidak pernah ambil lock sendiri
+    bot.auto_collect   = true   -- tanpa ini bot tidak pernah ambil lock
     bot.custom_status  = "AutoSend Aktif"
 
     -- warp ke world deposit kalau belum di sana
