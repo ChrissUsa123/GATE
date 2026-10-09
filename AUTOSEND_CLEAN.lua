@@ -32,6 +32,11 @@ local CFG = {
     -- Interval polling drop (ms)
     ScanInterval = 1500,
 
+    -- true = CETAK SEMUA pesan console ke console Lucifer.
+    -- WAJIB true dulu supaya format pesan server bisa dilihat.
+    -- Set false setelah donate sudah terdeteksi.
+    Debug        = true,
+
     -- Prefix command chat
     Prefix       = ".",
 }
@@ -288,13 +293,24 @@ end
 
 -------------------------[ EVENTS ]-----------------------------
 
--- values adalah objek Variant (bukan tabel biasa).
--- API Lucifer: values:get(0):getString() = nama fungsi
---              values:get(1):getString() = isi pesan
+-- values idealnya objek Variant: values:get(0):getString().
+-- Sebagian versi Lucifer mengirimnya sebagai tabel biasa, jadi ada
+-- cadangan ke values[0]. Tanpa cadangan ini, satu error = console
+-- tidak pernah terbaca sama sekali.
 addEvent(Event.variantlist, function(values, netid)
-    local v0 = values and values:get(0):getString()
+    local v0, msg
+    local ok = pcall(function()
+        v0  = values:get(0):getString()
+        msg = values:get(1):getString()
+    end)
+    if not ok then
+        v0  = values and (values[0] or values[1])
+        msg = values and (values[1] or values[2])
+    end
+    if CFG.Debug then
+        print("[VARIANT] ok=" .. tostring(ok) .. " | " .. tostring(v0) .. " | " .. tostring(msg))
+    end
     if type(v0) == "string" and v0:find("OnConsoleMessage", 1, true) then
-        local msg = values:get(1):getString()
         if type(msg) == "string" then
             checkVendMessage(msg)
             handleDonationBox(msg)
@@ -303,6 +319,7 @@ addEvent(Event.variantlist, function(values, netid)
 end)
 
 addEvent(Event.game_message, function(text)
+    if CFG.Debug then print("[GAME] " .. tostring(text)) end
     checkVendMessage(text)
     handleDonationBox(text)
 end)
